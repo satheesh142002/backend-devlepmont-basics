@@ -1,0 +1,448 @@
+<!-- agent.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Call Desk – Agent Console (Inline Join)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; line-height: 1.4; }
+    h1 { margin: 0 0 4px; }
+    .muted { color: #666; margin: 0 0 16px; }
+    table { border-collapse: collapse; width: 100%; max-width: 1100px; margin-top: 12px; }
+    th, td { border: 1px solid #3333; padding: 10px; vertical-align: middle; }
+    th { background: #ffffff10; text-align: left; }
+    button { padding: 6px 12px; cursor: pointer; border: 1px solid #0000; border-radius: 8px; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    code { user-select: all; word-break: break-all; }
+    .tag { font-size: 12px; padding: 3px 8px; border-radius: 999px; background: #ffffff18; border: 1px solid #ffffff22; }
+    .panel { margin-top: 20px; padding: 14px; border: 1px solid #3333; border-radius: 12px; max-width: 1100px; }
+    .row-actions button { margin-right: 6px; }
+    .pill { padding: 2px 8px; background: #ffffff14; border: 1px solid #ffffff22; border-radius: 999px; font-size: 12px; }
+    .toolbar { display:flex; gap:8px; align-items:center; margin: 12px 0 8px; flex-wrap: wrap; }
+    audio { width: 100%; margin-top: 8px; }
+    .meters { display:flex; gap:12px; align-items:center; margin-top:8px; }
+    .bar { width:160px; height:8px; background:#00000020; border-radius:999px; overflow:hidden; }
+    .bar > span { display:block; height:100%; width:0%; background:#4caf50; transition:width 80ms linear; }
+    .statline { font-size:12px; color:#666; }
+    .err { color:#d33; }
+    .ok { color:#2a7; }
+  </style>
+</head>
+<body>
+  <h1>Call Desk</h1>
+  <p class="muted">
+    Calls stay <b>waiting</b> until you click <b>Accept</b>. Then click <b>Join (inline)</b> to connect your browser
+    audio on this page. The inline join is full-duplex: phone → browser and browser → phone.
+  </p>
+
+  <div class="toolbar">
+    <span class="pill">Polling: <span id="pollRate">1000</span>ms</span>
+    <button id="refresh">Refresh now</button>
+    <span id="status" style="margin-left:auto;"></span>
+  </div>
+
+  <table id="calls">
+    <thead>
+      <tr>
+        <th style="width:44%;">Call ID</th>
+        <th style="width:10%;">Age (s)</th>
+        <th style="width:16%;">Status</th>
+        <th style="width:30%;">Actions</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <!-- Inline Join Panel -->
+  <div class="panel" id="joinPanel" hidden>
+    <div><b>Inline call:</b> <code id="activeCallId">—</code></div>
+    <div id="inlineHint" class="muted">Click “Connect” to start; allow microphone when prompted.</div>
+
+    <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+      <button id="connectBtn">Connect</button>
+      <button id="disconnectBtn" disabled>Disconnect</button>
+
+      <label class="muted" style="display:flex; align-items:center; gap:6px;">
+        Mic:
+        <select id="micSelect"></select>
+      </label>
+      <label class="muted" style="display:flex; align-items:center; gap:6px;">
+        Speakers:
+        <select id="sinkSelect"></select>
+      </label>
+    </div>
+
+    <audio id="remoteAudio" autoplay playsinline controls></audio>
+
+    <div class="meters">
+      <div class="muted">Inbound</div>
+      <div class="bar"><span id="inBar"></span></div>
+      <div class="muted">Outbound</div>
+      <div class="bar"><span id="outBar"></span></div>
+    </div>
+    <div id="rtcState" class="statline"></div>
+  </div>
+
+<script>
+(() => {
+  const tbody = document.querySelector('#calls tbody');
+  const statusEl = document.getElementById('status');
+  const refreshBtn = document.getElementById('refresh');
+  const pollRateEl = document.getElementById('pollRate');
+
+  const panel = document.getElementById('joinPanel');
+  const activeCallEl = document.getElementById('activeCallId');
+  const inlineHint = document.getElementById('inlineHint');
+  const connectBtn = document.getElementById('connectBtn');
+  const disconnectBtn = document.getElementById('disconnectBtn');
+  const remoteAudio = document.getElementById('remoteAudio');
+  const rtcState = document.getElementById('rtcState');
+
+  const micSelect = document.getElementById('micSelect');
+  const sinkSelect = document.getElementById('sinkSelect');
+
+  const inBar = document.getElementById('inBar');
+  const outBar = document.getElementById('outBar');
+
+  const API_BASE = (location.origin && location.origin.startsWith('http'))
+    ? location.origin
+    : 'http://127.0.0.1:8000';
+
+  let currentCallId = null;
+  let pc = null;
+  let localStream = null;
+  let remoteStream = null;
+  let audioTransceiver = null;
+  let micDeviceId = null;
+  let meterTimer = null;
+
+  const POLL_MS = 1000;
+  pollRateEl.textContent = POLL_MS;
+
+  function setStatus(msg, ok = null) {
+    statusEl.textContent = msg || '';
+    statusEl.className = ok === true ? 'ok' : ok === false ? 'err' : '';
+  }
+  function flash(msg, ok = null) { setStatus(msg, ok); setTimeout(() => setStatus(''), 1800); }
+
+  refreshBtn.addEventListener('click', () => loadCalls(true));
+
+  async function listDevices() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    micSelect.innerHTML = '';
+    sinkSelect.innerHTML = '';
+    for (const d of devices) {
+      if (d.kind === 'audioinput') {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `Mic (${d.deviceId.slice(0,6)}…)`;
+        micSelect.appendChild(opt);
+      } else if (d.kind === 'audiooutput') {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || `Speakers (${d.deviceId.slice(0,6)}…)`;
+        sinkSelect.appendChild(opt);
+      }
+    }
+    if (!micSelect.value && micSelect.options.length) micSelect.selectedIndex = 0;
+    if (!sinkSelect.value && sinkSelect.options.length) sinkSelect.selectedIndex = 0;
+  }
+
+  micSelect.addEventListener('change', async () => {
+    micDeviceId = micSelect.value || undefined;
+    if (pc) await swapMic(micDeviceId);
+  });
+
+  sinkSelect.addEventListener('change', async () => {
+    const id = sinkSelect.value;
+    if (remoteAudio.sinkId !== undefined && id) {
+      try { await remoteAudio.setSinkId(id); } catch (e) { console.warn('setSinkId failed', e); }
+    }
+  });
+
+  async function getMicStream(deviceId) {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+      video: false
+    });
+  }
+
+  async function swapMic(deviceId) {
+    try {
+      const newStream = await getMicStream(deviceId);
+      const track = newStream.getAudioTracks()[0];
+      if (audioTransceiver && track) {
+        await audioTransceiver.sender.replaceTrack(track);
+      }
+      if (localStream) localStream.getTracks().forEach(t => t.stop());
+      localStream = newStream;
+      startOutboundMeter(localStream);
+    } catch (e) {
+      console.error('swapMic failed', e);
+      setStatus('Failed to switch microphone.', false);
+    }
+  }
+
+  async function loadCalls(manual = false) {
+    try {
+      const res = await fetch(`${API_BASE}/api/active_calls`, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      renderRows(data);
+      if (manual) flash('Refreshed.', true);
+      if (currentCallId && !data.find(r => r.call_id === currentCallId)) {
+        await disconnectInline(true);
+      }
+    } catch (e) {
+      console.error('Failed to load calls:', e);
+      setStatus(`Failed to load calls from ${API_BASE}. Is the server running?`, false);
+    }
+  }
+
+  function renderRows(rows) {
+    tbody.innerHTML = '';
+    if (!rows || !rows.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="4" class="muted">No active calls.</td>`;
+      tbody.appendChild(tr);
+      return;
+    }
+    rows.forEach(row => {
+      const canAccept = (row.status === 'waiting');
+      const canJoin = (row.status === 'human');
+      const isActive = (row.call_id === currentCallId);
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><code>${row.call_id}</code></td>
+        <td>${row.age_s}</td>
+        <td><span class="tag">${row.status}${isActive ? ' • inline' : ''}</span></td>
+        <td class="row-actions">
+          <button ${canAccept ? '' : 'disabled'} onclick="acceptOne('${row.call_id}')">Accept</button>
+          <button ${canJoin ? '' : 'disabled'} onclick="prepInline('${row.call_id}')">Join (inline)</button>
+          <button onclick="declineOne('${row.call_id}')">Decline</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+    setStatus('');
+  }
+
+  window.acceptOne = async (id) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/accept`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ call_id: id })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      flash(`Accepted ${id}`, true);
+      await loadCalls();
+    } catch (e) {
+      console.error('acceptOne failed:', e);
+      setStatus(`Accept failed: ${e.message}`, false);
+    }
+  };
+
+  window.declineOne = async (id) => {
+    if (!confirm('Decline this call?')) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/decline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ call_id: id })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (id === currentCallId) await disconnectInline(true);
+      flash(`Declined ${id}`, true);
+      await loadCalls();
+    } catch (e) {
+      console.error('declineOne failed:', e);
+      setStatus(`Decline failed: ${e.message}`, false);
+    }
+  };
+
+  window.prepInline = async (id) => {
+    currentCallId = id;
+    activeCallEl.textContent = id;
+    panel.hidden = false;
+    inlineHint.textContent = 'Click “Connect” to start; allow microphone when prompted.';
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+    await listDevices();
+  };
+
+  connectBtn.addEventListener('click', async () => {
+    // Clean up any previous attempt so we can retry cleanly
+    await disconnectInline(true);
+
+    connectBtn.disabled = true;
+    try {
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
+      });
+
+      pc.addEventListener('iceconnectionstatechange', () => updateRtcState());
+      pc.addEventListener('connectionstatechange', () => updateRtcState());
+      pc.addEventListener('icecandidateerror', (ev) => {
+        console.error('ICE candidate error:', ev);
+        setStatus(`ICE candidate error: ${ev.errorText || ev.url || 'unknown'}`, false);
+      });
+
+      // Must exist before we createOffer
+      audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+
+      // Remote (caller -> agent)
+      remoteStream = new MediaStream();
+      pc.ontrack = (ev) => {
+        if (ev.track.kind === 'audio') {
+          remoteStream.addTrack(ev.track);
+          remoteAudio.srcObject = remoteStream;
+          remoteAudio.muted = false;
+          remoteAudio.volume = 1;
+          const p = remoteAudio.play();
+          if (p && typeof p.then === 'function') p.catch(()=>{});
+          startInboundMeter(remoteAudio);
+        }
+      };
+
+      // Prime permissions first so enumerateDevices has labels
+      await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      await listDevices();
+      micDeviceId = micSelect.value || undefined;
+
+      // Local mic (agent -> caller)
+      localStream = await getMicStream(micDeviceId);
+      const micTrack = localStream.getAudioTracks()[0];
+      if (micTrack) await audioTransceiver.sender.replaceTrack(micTrack);
+      startOutboundMeter(localStream);
+
+      // Offer to server
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const res = await fetch(`${API_BASE}/webrtc/offer/${encodeURIComponent(currentCallId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sdp: offer.sdp, type: offer.type })
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(()=>'');
+        throw new Error(`Server ${res.status} ${res.statusText} ${text ? '- ' + text.slice(0,200) : ''}`);
+      }
+
+      let answer;
+      try {
+        answer = await res.json();
+      } catch (e) {
+        const text = await res.text().catch(()=>'<no body>');
+        throw new Error(`Answer JSON parse failed. Body: ${text.slice(0,200)}`);
+      }
+
+      if (!answer || !answer.sdp || !answer.type) {
+        throw new Error('Bad answer payload from server.');
+      }
+
+      await pc.setRemoteDescription(answer);
+
+      inlineHint.textContent = 'Connected. You should hear the caller.';
+      disconnectBtn.disabled = false;
+
+      if (remoteAudio.sinkId !== undefined && sinkSelect.value) {
+        try { await remoteAudio.setSinkId(sinkSelect.value); } catch (e) { console.warn('setSinkId failed', e); }
+      }
+    } catch (e) {
+      console.error('Inline connect failed:', e);
+      inlineHint.textContent = `Failed to connect: ${e.message}`;
+      connectBtn.disabled = false;
+    }
+  });
+
+  disconnectBtn.addEventListener('click', async () => {
+    await disconnectInline();
+  });
+
+  async function disconnectInline(silent = false) {
+    try {
+      if (pc) {
+        pc.getSenders().forEach(s => s.track && s.track.stop());
+        pc.getReceivers().forEach(r => r.track && r.track.stop());
+        pc.close();
+      }
+    } catch {}
+    pc = null;
+    audioTransceiver = null;
+
+    try { if (localStream) localStream.getTracks().forEach(t => t.stop()); } catch {}
+    localStream = null;
+
+    remoteStream = null;
+    remoteAudio.srcObject = null;
+
+    if (meterTimer) { cancelAnimationFrame(meterTimer); meterTimer = null; }
+    inBar.style.width = '0%';
+    outBar.style.width = '0%';
+
+    disconnectBtn.disabled = true;
+    connectBtn.disabled = false;
+    inlineHint.textContent = silent ? 'Inline session idle.' : 'Disconnected.';
+    updateRtcState();
+  }
+
+  function startOutboundMeter(stream) {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const loop = () => {
+        analyser.getByteFrequencyData(data);
+        const avg = data.reduce((a,b)=>a+b,0) / data.length;
+        outBar.style.width = Math.min(100, (avg/255)*100) + '%';
+        meterTimer = requestAnimationFrame(loop);
+      };
+      loop();
+    } catch {}
+  }
+
+  function startInboundMeter(audioEl) {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ctx.createMediaElementSource(audioEl);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      analyser.connect(ctx.destination);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const loop = () => {
+        analyser.getByteFrequencyData(data);
+        const avg = data.reduce((a,b)=>a+b,0) / data.length;
+        inBar.style.width = Math.min(100, (avg/255)*100) + '%';
+        if (meterTimer) requestAnimationFrame(loop);
+      };
+      if (!meterTimer) meterTimer = requestAnimationFrame(loop);
+    } catch {}
+  }
+
+  function updateRtcState() {
+    const s1 = pc ? (pc.connectionState || 'unknown') : '—';
+    const s2 = pc ? (pc.iceConnectionState || 'unknown') : '—';
+    rtcState.textContent = `PC: ${s1} • ICE: ${s2}`;
+  }
+
+  setInterval(loadCalls, POLL_MS);
+  loadCalls();
+
+  // Expose for row buttons
+  window.acceptOne = window.acceptOne;
+  window.declineOne = window.declineOne;
+  window.prepInline = window.prepInline;
+})();
+</script>
+</body>
+</html>
